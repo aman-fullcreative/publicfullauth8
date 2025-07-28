@@ -1,0 +1,108 @@
+# Fixed TruffleHog GitHub Actions Workflow
+# Removes duplicate flags that cause "flag cannot be repeated" errors
+
+name: "TruffleHog Secret Scanning"
+
+on:
+  push:
+    branches: [ "main", "master", "develop" ]
+  pull_request:
+    branches: [ "main", "master", "develop" ]
+  schedule:
+    # Weekly full scan at 2 AM UTC on Sundays
+    - cron: '0 2 * * 0'
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+  id-token: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  trufflehog:
+    runs-on: ubuntu-latest
+    name: TruffleHog Secret Scan
+    timeout-minutes: 30
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for comprehensive scanning
+          
+      - name: Run TruffleHog Scan
+        uses: trufflesecurity/trufflehog@main
+        with:
+          # IMPORTANT: Do NOT include these flags in extra_args as they are already provided by the action:
+          # --no-update (always included by the action)
+          # --fail (always included by the action)  
+          # --github-actions (always included by the action)
+          
+          extra_args: >-
+            --config=.trufflehog.yml
+            --exclude-paths=.trufflehog-exclude-paths.txt
+            --json
+            --archive-max-size=100MB
+            --archive-max-depth=10
+            --archive-timeout=5m
+            --concurrency=4
+            --filter-unverified
+            --filter-entropy=3.0
+            --max-depth=20
+            --results=verified,unknown
+            
+      - name: Upload Scan Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trufflehog-scan-results-${{ github.run_number }}
+          path: |
+            **/*.json
+          retention-days: 30
+          
+      - name: Comment PR on Secret Detection
+        if: failure() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '🚨 **TruffleHog detected potential secrets in this PR!** Please review the scan results and rotate any exposed credentials before merging.'
+            })
+            
+      - name: Create Security Advisory
+        if: failure() && github.event_name == 'schedule'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `🔐 Scheduled TruffleHog Scan Found Potential Secrets - ${new Date().toISOString().split('T')[0]}`;
+            const body = `
+            ## Security Alert: Potential Secrets Detected
+            
+            Our scheduled TruffleHog scan has detected potential secrets in the repository.
+            
+            **Action Required:**
+            1. Review the scan results in the workflow artifacts
+            2. Identify and rotate any exposed credentials
+            3. Remove secrets from version control history if necessary
+            4. Update security documentation
+            
+            **Scan Details:**
+            - Repository: ${context.repo.owner}/${context.repo.repo}
+            - Branch: ${context.ref}
+            - Workflow Run: ${context.runId}
+            - Triggered: ${new Date().toISOString()}
+            `;
+            
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: title,
+              body: body,
+              labels: ['security', 'urgent']
+            })
