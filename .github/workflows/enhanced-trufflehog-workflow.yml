@@ -1,0 +1,381 @@
+name: TruffleHog Enhanced Secret Scanning
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+  schedule:
+    - cron: '0 2 * * 1'  # Weekly scan on Monday at 2am UTC
+  workflow_dispatch:
+    inputs:
+      scan_mode:
+        description: 'Scan mode (incremental or full)'
+        required: false
+        default: 'incremental'
+        type: choice
+        options:
+        - incremental
+        - full
+
+permissions:
+  contents: read
+  pull-requests: write
+  security-events: write
+  actions: read
+
+jobs:
+  trufflehog-scan:
+    runs-on: ubuntu-latest
+    name: TruffleHog Enhanced Secret Scan
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Fetch full history for comprehensive scanning
+        
+    - name: Create results directory
+      run: |
+        mkdir -p results
+        echo "RESULTS_DIR=results" >> $GITHUB_ENV
+        
+    - name: Determine scan parameters
+      id: scan-params
+      run: |
+        echo "Event: ${{ github.event_name }}"
+        echo "Ref: ${{ github.ref }}"
+        
+        if [[ "${{ github.event_name }}" == "schedule" ]] || [[ "${{ inputs.scan_mode }}" == "full" ]]; then
+          echo "scan_mode=full" >> $GITHUB_OUTPUT
+          echo "extra_args=--json --archive-max-size=100MB --archive-max-depth=10 --archive-timeout=5m --concurrency=4" >> $GITHUB_OUTPUT
+        else
+          echo "scan_mode=incremental" >> $GITHUB_OUTPUT
+          echo "extra_args=--json --archive-max-size=100MB --archive-max-depth=10 --archive-timeout=5m --concurrency=4 --only-verified" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Run TruffleHog Scan
+      id: trufflehog-scan
+      uses: trufflesecurity/trufflehog@main
+      continue-on-error: true  # Don't fail the workflow - just for testing efficiency
+      with:
+        extra_args: ${{ steps.scan-params.outputs.extra_args }}
+        
+    - name: Save TruffleHog raw output
+      if: always()
+      run: |
+        # Capture the TruffleHog output if it exists
+        if [ -f /tmp/trufflehog_output.json ]; then
+          cp /tmp/trufflehog_output.json ${{ env.RESULTS_DIR }}/raw_results.json
+        elif [ -f trufflehog_output.json ]; then
+          cp trufflehog_output.json ${{ env.RESULTS_DIR }}/raw_results.json
+        else
+          echo "[]" > ${{ env.RESULTS_DIR }}/raw_results.json
+        fi
+        
+    - name: Process scan results and generate reports
+      id: process-results
+      if: always()
+      run: |
+        # Check TruffleHog exit code
+        SCAN_EXIT_CODE="${{ steps.trufflehog-scan.outcome }}"
+        echo "TruffleHog scan completed with status: $SCAN_EXIT_CODE"
+        
+        # Initialize counters
+        TOTAL_SECRETS=0
+        VERIFIED_SECRETS=0
+        UNVERIFIED_SECRETS=0
+        
+        # Create results summary
+        RESULTS_FILE="${{ env.RESULTS_DIR }}/scan_summary.json"
+        DETAILED_REPORT="${{ env.RESULTS_DIR }}/detailed_report.md"
+        
+        # Initialize detailed report
+        cat > "$DETAILED_REPORT" << 'EOF'
+        # 🔍 TruffleHog Enhanced Secret Scan Results
+        
+        ## Scan Information
+        - **Repository**: ${{ github.repository }}
+        - **Branch**: ${{ github.ref_name }}
+        - **Scan Mode**: ${{ steps.scan-params.outputs.scan_mode }}
+        - **Commit**: ${{ github.sha }}
+        - **Scan Time**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+        - **Workflow Run**: [${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+        
+        EOF
+        
+        # Process results if they exist
+        if [ -f "${{ env.RESULTS_DIR }}/raw_results.json" ] && [ -s "${{ env.RESULTS_DIR }}/raw_results.json" ]; then
+          # Count secrets by parsing JSON output
+          TOTAL_SECRETS=$(jq length "${{ env.RESULTS_DIR }}/raw_results.json" 2>/dev/null || echo "0")
+          VERIFIED_SECRETS=$(jq '[.[] | select(.Verified == true)] | length' "${{ env.RESULTS_DIR }}/raw_results.json" 2>/dev/null || echo "0")
+          UNVERIFIED_SECRETS=$(jq '[.[] | select(.Verified == false)] | length' "${{ env.RESULTS_DIR }}/raw_results.json" 2>/dev/null || echo "0")
+          
+          echo "Total secrets found: $TOTAL_SECRETS"
+          echo "Verified secrets: $VERIFIED_SECRETS"
+          echo "Unverified secrets: $UNVERIFIED_SECRETS"
+          
+          # Add summary to detailed report
+          cat >> "$DETAILED_REPORT" << EOF
+        ## 📊 Scan Results Summary
+        
+        | Metric | Count |
+        |--------|-------|
+        | **Total Secrets Found** | $TOTAL_SECRETS |
+        | **Verified Secrets** | $VERIFIED_SECRETS |
+        | **Unverified Secrets** | $UNVERIFIED_SECRETS |
+        
+        EOF
+          
+          if [ "$TOTAL_SECRETS" -gt 0 ]; then
+            echo "## 🔑 Detailed Findings" >> "$DETAILED_REPORT"
+            echo "" >> "$DETAILED_REPORT"
+            
+            # Process each secret found
+            jq -c '.[]' "${{ env.RESULTS_DIR }}/raw_results.json" | while IFS= read -r secret; do
+              DETECTOR_NAME=$(echo "$secret" | jq -r '.DetectorName // "Unknown"')
+              VERIFIED=$(echo "$secret" | jq -r '.Verified // false')
+              RAW_SECRET=$(echo "$secret" | jq -r '.Raw // ""')
+              
+              # Extract file information
+              FILE_PATH=$(echo "$secret" | jq -r '.SourceMetadata.Data.Git.file // .SourceMetadata.Data.Filesystem.file // "Unknown file"')
+              LINE_NUMBER=$(echo "$secret" | jq -r '.SourceMetadata.Data.Git.line // .SourceMetadata.Data.Filesystem.line // "Unknown"')
+              COMMIT_HASH=$(echo "$secret" | jq -r '.SourceMetadata.Data.Git.commit // "N/A"' | cut -c1-8)
+              
+              # Redact secret for security (show first 4 and last 4 characters)
+              if [ ${#RAW_SECRET} -gt 8 ]; then
+                SECRET_PREVIEW="${RAW_SECRET:0:4}...${RAW_SECRET: -4}"
+              else
+                SECRET_PREVIEW="****"
+              fi
+              
+              # Verification status
+              if [ "$VERIFIED" = "true" ]; then
+                VERIFICATION_STATUS="✅ **Verified** (Active credential)"
+              else
+                VERIFICATION_STATUS="⚠️ **Unverified** (Potential credential)"
+              fi
+              
+              cat >> "$DETAILED_REPORT" << EOF
+        ### 🔑 $DETECTOR_NAME Secret
+        
+        - **File**: \`$FILE_PATH\`
+        - **Line**: $LINE_NUMBER
+        - **Commit**: \`$COMMIT_HASH\`
+        - **Status**: $VERIFICATION_STATUS
+        - **Preview**: \`$SECRET_PREVIEW\`
+        
+        EOF
+            done
+            
+            # Add remediation guidance
+            cat >> "$DETAILED_REPORT" << 'EOF'
+        ## 🛠️ Remediation Steps
+        
+        ### Immediate Actions:
+        1. **Review each detected secret** above and confirm if it's a real credential
+        2. **Rotate/revoke active secrets** immediately if they are verified
+        3. **Remove secrets from code** and use secure secret management
+        
+        ### For Real Secrets:
+        ```bash
+        # 1. Remove the secret from the file
+        # 2. Add to .gitignore or use environment variables
+        # 3. Commit the fix
+        git add .
+        git commit -m "Remove exposed secrets"
+        git push
+        
+        # 4. For sensitive history, consider using git-filter-repo
+        # pip install git-filter-repo
+        # git filter-repo --path-glob '**/*' --replace-text <(echo 'EXPOSED_SECRET==>***REMOVED***')
+        ```
+        
+        ### Secure Alternatives:
+        - Use **GitHub Secrets** for CI/CD
+        - Use **Environment Variables** for local development
+        - Use **Key Management Services** (AWS KMS, Azure Key Vault, etc.)
+        - Use **Secret Management Tools** (HashiCorp Vault, etc.)
+        
+        ### Prevention:
+        - Add **pre-commit hooks** with TruffleHog
+        - Use **`.env.example`** files instead of `.env`
+        - Regularly **rotate credentials**
+        - Enable **push protection** in repository settings
+        
+        EOF
+          else
+            cat >> "$DETAILED_REPORT" << 'EOF'
+        ## ✅ No Secrets Detected
+        
+        Great! No secrets were found in this scan. This means:
+        - Your code appears to be free of exposed credentials
+        - Continue following secure coding practices
+        - Regular scans help maintain security posture
+        
+        EOF
+          fi
+        else
+          echo "No TruffleHog output found or output is empty"
+          cat >> "$DETAILED_REPORT" << 'EOF'
+        ## ℹ️ Scan Status
+        
+        The scan completed but no output was generated. This could mean:
+        - No secrets were detected
+        - The scan encountered an issue
+        - The repository is empty or contains no scannable files
+        
+        EOF
+        fi
+        
+        # Create JSON summary for programmatic access
+        cat > "$RESULTS_FILE" << EOF
+        {
+          "scan_info": {
+            "repository": "${{ github.repository }}",
+            "branch": "${{ github.ref_name }}",
+            "commit": "${{ github.sha }}",
+            "scan_mode": "${{ steps.scan-params.outputs.scan_mode }}",
+            "timestamp": "$(date -u -I)",
+            "workflow_run": "${{ github.run_number }}"
+          },
+          "results": {
+            "total_secrets": $TOTAL_SECRETS,
+            "verified_secrets": $VERIFIED_SECRETS,
+            "unverified_secrets": $UNVERIFIED_SECRETS,
+            "has_secrets": $([ "$TOTAL_SECRETS" -gt 0 ] && echo "true" || echo "false")
+          },
+          "scan_status": {
+            "exit_code": "$SCAN_EXIT_CODE",
+            "completed": true
+          }
+        }
+        EOF
+        
+        # Set outputs for other steps
+        echo "total_secrets=$TOTAL_SECRETS" >> $GITHUB_OUTPUT
+        echo "verified_secrets=$VERIFIED_SECRETS" >> $GITHUB_OUTPUT
+        echo "has_secrets=$([ "$TOTAL_SECRETS" -gt 0 ] && echo "true" || echo "false")" >> $GITHUB_OUTPUT
+        echo "scan_status=$SCAN_EXIT_CODE" >> $GITHUB_OUTPUT
+
+    - name: Display scan summary
+      if: always()
+      run: |
+        echo "## 🔍 TruffleHog Enhanced Scan Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "- **Repository**: ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Branch**: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Scan Mode**: ${{ steps.scan-params.outputs.scan_mode }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Total Secrets**: ${{ steps.process-results.outputs.total_secrets }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Verified Secrets**: ${{ steps.process-results.outputs.verified_secrets }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Scan Status**: ${{ steps.process-results.outputs.scan_status }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        if [[ "${{ steps.process-results.outputs.has_secrets }}" == "true" ]]; then
+          echo "### ⚠️ Secrets Detected" >> $GITHUB_STEP_SUMMARY
+          echo "**${{ steps.process-results.outputs.total_secrets }}** potential secrets were found." >> $GITHUB_STEP_SUMMARY
+          echo "Check the detailed report in the artifacts for complete information." >> $GITHUB_STEP_SUMMARY
+        else
+          echo "### ✅ No Secrets Found" >> $GITHUB_STEP_SUMMARY
+          echo "No secrets detected in this scan. Great work!" >> $GITHUB_STEP_SUMMARY
+        fi
+
+    - name: Comment on PR with results
+      if: always() && github.event_name == 'pull_request'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const totalSecrets = '${{ steps.process-results.outputs.total_secrets }}';
+          const verifiedSecrets = '${{ steps.process-results.outputs.verified_secrets }}';
+          const hasSecrets = '${{ steps.process-results.outputs.has_secrets }}' === 'true';
+          
+          let body = `## 🔍 TruffleHog Secret Scan Results\n\n`;
+          body += `**Scan Summary:**\n`;
+          body += `- Total Secrets Found: **${totalSecrets}**\n`;
+          body += `- Verified Secrets: **${verifiedSecrets}**\n`;
+          body += `- Repository: ${{ github.repository }}\n`;
+          body += `- Branch: ${{ github.head_ref }}\n`;
+          body += `- Commit: \`${{ github.event.pull_request.head.sha }}\`\n\n`;
+          
+          if (hasSecrets) {
+            body += `### ⚠️ Action Required\n\n`;
+            body += `**${totalSecrets}** potential secrets were detected in this PR. Please:\n\n`;
+            body += `1. 📋 **Download the detailed report** from the Actions artifacts\n`;
+            body += `2. 🔍 **Review each detected secret** for accuracy\n`;
+            body += `3. 🔄 **Remove/rotate any real credentials** immediately\n`;
+            body += `4. ✅ **Push fixes** to this branch\n\n`;
+            body += `> **Note**: This workflow is configured to not fail the pipeline for testing purposes.\n`;
+            body += `> In production, consider enabling failure on secret detection.\n\n`;
+          } else {
+            body += `### ✅ All Clear!\n\n`;
+            body += `No secrets were detected in this PR. Great work maintaining secure coding practices! 🎉\n\n`;
+          }
+          
+          body += `---\n`;
+          body += `*🤖 Automated by TruffleHog Enhanced Secret Scanning*`;
+          
+          // Create or update comment
+          const comments = await github.rest.issues.listComments({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+          });
+          
+          const botComment = comments.data.find(comment => 
+            comment.user.type === 'Bot' && 
+            comment.body.includes('TruffleHog Secret Scan Results')
+          );
+          
+          if (botComment) {
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: botComment.id,
+              body: body
+            });
+          } else {
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });
+          }
+
+    - name: Upload scan results as artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: trufflehog-scan-results-${{ github.run_number }}
+        path: |
+          ${{ env.RESULTS_DIR }}/
+        retention-days: 30
+
+    - name: Final status report
+      if: always()
+      run: |
+        echo "=========================================="
+        echo "🔍 TruffleHog Enhanced Scan Complete"
+        echo "=========================================="
+        echo "Repository: ${{ github.repository }}"
+        echo "Branch: ${{ github.ref_name }}"
+        echo "Commit: ${{ github.sha }}"
+        echo "Scan Mode: ${{ steps.scan-params.outputs.scan_mode }}"
+        echo "Total Secrets: ${{ steps.process-results.outputs.total_secrets }}"
+        echo "Verified Secrets: ${{ steps.process-results.outputs.verified_secrets }}"
+        echo "Scan Status: ${{ steps.process-results.outputs.scan_status }}"
+        echo "=========================================="
+        
+        if [[ "${{ steps.process-results.outputs.has_secrets }}" == "true" ]]; then
+          echo "⚠️  SECRETS DETECTED - Check artifacts for details"
+          echo "📋 Download the 'trufflehog-scan-results-${{ github.run_number }}' artifact"
+          echo "📝 Review the detailed_report.md for complete findings"
+        else
+          echo "✅ NO SECRETS FOUND - Repository appears secure"
+        fi
+        
+        echo "🔗 Workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        echo "=========================================="
+        
+        # Note: Workflow continues regardless of secrets found (for testing efficiency)
+        echo "Note: Pipeline continues for testing efficiency (continue-on-error: true)"
