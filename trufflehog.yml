@@ -1,0 +1,212 @@
+# TruffleHog Configuration File
+# This file configures TruffleHog secret scanning behavior
+# See: https://docs.trufflesecurity.com for full documentation
+
+# Global scan configuration
+version: "3"
+
+# Chunk scanning settings for large repositories
+chunk_size: 10485760  # 10MB chunks
+concurrency: 4
+
+# Results filtering
+filter_unverified: true  # Only report verified secrets by default
+filter_entropy: 3.0      # Minimum entropy threshold for detections
+
+# Verification settings
+verify: true
+timeout: 30s
+
+# Output configuration
+format: "json"
+no_update: true
+
+# Archive handling
+archive:
+  max_size: 104857600    # 100MB max archive size
+  max_depth: 10          # Maximum nested archive depth
+  timeout: 300           # 5 minutes timeout for archive extraction
+
+# Detector configuration
+detectors:
+  # Include high-confidence detectors
+  include:
+    - "AWS"
+    - "Azure"
+    - "GCP"
+    - "GitHub"
+    - "GitLab"
+    - "Slack"
+    - "Stripe"
+    - "Twilio"
+    - "SendGrid"
+    - "Mailgun"
+    - "JWT"
+    - "MongoDB"
+    - "MySQL"
+    - "PostgreSQL"
+    - "Redis"
+    - "OpenAI"
+    - "Anthropic"
+    - "Huggingface"
+    - "Docker"
+    - "NPM"
+    - "PyPI"
+    - "SSH"
+    - "RSA"
+    - "PEM"
+    - "PKCS"
+
+  # Exclude high false-positive detectors
+  exclude:
+    - "Generic"           # Too many false positives
+    - "URI"              # Often catches non-secret URIs
+    - "Email"            # Email addresses aren't secrets
+    - "Keyword"          # Generic keyword matches
+
+# Custom detectors for organization-specific secrets
+custom_detectors:
+  - name: "Internal API Key"
+    detector_type: "regex"
+    regex: "internal_api_[a-zA-Z0-9]{32}"
+    keywords:
+      - "internal_api"
+    verify: false
+
+  - name: "Database Connection String"
+    detector_type: "regex"
+    regex: "(?i)(mongodb|mysql|postgresql|redis)://[^\\s]+"
+    keywords:
+      - "mongodb://"
+      - "mysql://"
+      - "postgresql://"
+      - "redis://"
+    verify: true
+
+  - name: "JWT Token"
+    detector_type: "regex"
+    regex: "eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+"
+    keywords:
+      - "eyJ"
+    verify: false
+
+# Verification endpoints for enterprise/self-hosted services
+verification_endpoints:
+  github: "https://api.github.com"
+  gitlab: "https://gitlab.com/api/v4"
+  # Add custom endpoints for enterprise installations
+  # custom_service: "https://your-enterprise-instance.com/api"
+
+# Word exclusions to reduce false positives
+exclude_detectors_with_keywords:
+  - "example"
+  - "sample"
+  - "test"
+  - "mock"
+  - "fake"
+  - "dummy"
+  - "placeholder"
+  - "template"
+  - "demo"
+  - "lorem"
+  - "ipsum"
+  - "changeme"
+  - "replace"
+  - "your_key_here"
+  - "insert_key_here"
+  - "api_key_here"
+  - "secret_here"
+  - "password_here"
+  - "token_here"
+
+# MIME type filtering
+include_mime_types:
+  - "text/plain"
+  - "text/x-shellscript"
+  - "text/x-python"
+  - "text/x-java-source"
+  - "text/x-c"
+  - "text/x-c++"
+  - "text/x-csharp"
+  - "text/x-go"
+  - "text/x-ruby"
+  - "text/x-php"
+  - "text/javascript"
+  - "text/typescript"
+  - "application/json"
+  - "application/xml"
+  - "application/yaml"
+  - "application/x-yaml"
+
+# Skip scanning these file extensions entirely
+skip_file_extensions:
+  - ".jpg"
+  - ".jpeg"
+  - ".png"
+  - ".gif"
+  - ".bmp"
+  - ".svg"
+  - ".ico"
+  - ".webp"
+  - ".mp4"
+  - ".avi"
+  - ".mov"
+  - ".wmv"
+  - ".mp3"
+  - ".wav"
+  - ".flac"
+  - ".pdf"
+  - ".doc"
+  - ".docx"
+  - ".xls"
+  - ".xlsx"
+  - ".ppt"
+  - ".pptx"
+  - ".zip"
+  - ".tar"
+  - ".gz"
+  - ".bz2"
+  - ".7z"
+  - ".rar"
+  - ".exe"
+  - ".dll"
+  - ".so"
+  - ".dylib"
+  - ".bin"
+  - ".class"
+  - ".jar"
+  - ".war"
+  - ".ear"
+
+# Performance tuning
+max_target_megabytes: 100    # Skip scanning files larger than 100MB
+max_archive_count: 1000      # Maximum number of archives to process
+max_file_size: 10485760      # 10MB max individual file size
+
+# Logging configuration
+log_level: "info"
+debug: false
+
+# GitHub-specific configuration (when running in GitHub Actions)
+github:
+  endpoint: "https://api.github.com"
+  include_forks: false
+  include_members: false
+  include_repos: true
+  include_wiki: false
+  include_issues: false
+  include_pull_requests: false
+
+# Additional scanning options
+scan_options:
+  include_paths: []          # Specific paths to include (empty = all)
+  max_depth: 1000           # Maximum directory traversal depth
+  follow_symlinks: false    # Don't follow symbolic links
+  scan_hidden_files: false  # Skip hidden files/directories
+  
+# Enterprise features (if applicable)
+enterprise:
+  enabled: false
+  api_endpoint: ""
+  organization_id: ""
+  scanner_group: ""
